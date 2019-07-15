@@ -1,5 +1,4 @@
 env.PROJ_DIR='src/learningGo'
-
 node {
     withEnv(["GOPATH=$WORKSPACE"]) {     
         stage('Init gopath') {
@@ -35,3 +34,4 @@ node {
         }
     }
 }
+
