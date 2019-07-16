@@ -5,9 +5,9 @@ import (
 	"database/sql/driver"
 	"fmt"
 	mysqlDriver "github.com/go-sql-driver/mysql"
-	"github.com/hanchuanchuan/go-mysql/mysql"
-	"github.com/hanchuanchuan/go-mysql/replication"
 	"github.com/juju/errors"
+	"github.com/siddontang/go-mysql/mysql"
+	"github.com/siddontang/go-mysql/replication"
 	log "github.com/sirupsen/logrus"
 	"math"
 	"strconv"
@@ -210,13 +210,14 @@ func (s *session) Parser(ctx context.Context) {
 		port = uint16(s.opt.port)
 	}
 	cfg := replication.BinlogSyncerConfig{
-		ServerID: 2000111111,
+		ServerID: 2000111111 + uint32(s.sessionVars.ConnectionID%10000),
 		Flavor:   flavor,
 
 		Host:     host,
 		Port:     port,
 		User:     s.opt.user,
 		Password: s.opt.password,
+		// UseDecimal: true,
 		// RawModeEnabled:  p.cfg.RawMode,
 		// SemiSyncEnabled: p.cfg.SemiSync,
 	}

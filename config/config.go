@@ -75,6 +75,7 @@ type Config struct {
 	Inc                 Inc               `toml:"inc" json:"inc"`
 	Osc                 Osc               `toml:"osc" json:"osc"`
 	Ghost               Ghost             `toml:"ghost" json:"ghost"`
+	IncLevel            IncLevel          `toml:"inc_level" json:"inc_level"`
 	CompatibleKillQuery bool              `toml:"compatible-kill-query" json:"compatible-kill-query"`
 }
 
@@ -295,20 +296,25 @@ type Inc struct {
 	CheckTimestampCount     bool `toml:"check_timestamp_count" json:"check_timestamp_count"`
 
 	EnableAutoIncrementUnsigned bool `toml:"enable_autoincrement_unsigned" json:"enable_autoincrement_unsigned"`
-	EnableBlobType              bool `toml:"enable_blob_type" json:"enable_blob_type"`
-	EnableColumnCharset         bool `toml:"enable_column_charset" json:"enable_column_charset"`
-	EnableDropDatabase          bool `toml:"enable_drop_database" json:"enable_drop_database"`
-	EnableDropTable             bool `toml:"enable_drop_table" json:"enable_drop_table"` // 允许删除表
-	EnableEnumSetBit            bool `toml:"enable_enum_set_bit" json:"enable_enum_set_bit"`
+	// 允许blob,text,json列设置为NOT NULL
+	EnableBlobNotNull   bool `toml:"enable_blob_not_null" json:"enable_blob_not_null"`
+	EnableBlobType      bool `toml:"enable_blob_type" json:"enable_blob_type"`
+	EnableColumnCharset bool `toml:"enable_column_charset" json:"enable_column_charset"`
+	EnableDropDatabase  bool `toml:"enable_drop_database" json:"enable_drop_database"`
+	EnableDropTable     bool `toml:"enable_drop_table" json:"enable_drop_table"` // 允许删除表
+	EnableEnumSetBit    bool `toml:"enable_enum_set_bit" json:"enable_enum_set_bit"`
 
 	// DML指纹功能,开启后,在审核时,类似DML将直接复用审核结果,可大幅优化审核效率
 	EnableFingerprint      bool `toml:"enable_fingerprint" json:"enable_fingerprint"`
 	EnableForeignKey       bool `toml:"enable_foreign_key" json:"enable_foreign_key"`
 	EnableIdentiferKeyword bool `toml:"enable_identifer_keyword" json:"enable_identifer_keyword"`
 	EnableJsonType         bool `toml:"enable_json_type" json:"enable_json_type"`
+	// 是否启用自定义审核级别设置
+	EnableLevel bool `toml:"enable_level" json:"enable_level"`
 	// 是否允许指定存储引擎
 	EnableSetEngine        bool `toml:"enable_set_engine" json:"enable_set_engine"`
-	EnableNullable         bool `toml:"enable_nullable" json:"enable_nullable"` // 允许空列
+	EnableNullable         bool `toml:"enable_nullable" json:"enable_nullable"`               // 允许空列
+	EnableNullIndexName    bool `toml:"enable_null_index_name" json:"enable_null_index_name"` //是否允许不指定索引名
 	EnableOrderByRand      bool `toml:"enable_orderby_rand" json:"enable_orderby_rand"`
 	EnablePartitionTable   bool `toml:"enable_partition_table" json:"enable_partition_table"`
 	EnablePKColumnsOnlyInt bool `toml:"enable_pk_columns_only_int" json:"enable_pk_columns_only_int"`
@@ -317,7 +323,6 @@ type Inc struct {
 	// 是否允许设置字符集和排序规则
 	EnableSetCharset   bool `toml:"enable_set_charset" json:"enable_set_charset"`
 	EnableSetCollation bool `toml:"enable_set_collation" json:"enable_set_collation"`
-
 	// 开启sql统计
 	EnableSqlStatistic bool `toml:"enable_sql_statistic" json:"enable_sql_statistic"`
 
@@ -361,8 +366,6 @@ type Inc struct {
 
 	// 支持的存储引擎,多个时以分号分隔
 	SupportEngine string `toml:"support_engine" json:"support_engine"`
-
-	EnableNullIndexName bool `toml:"enable_null_index_name" json:"enable_null_index_name"` //是否允许不指定索引名
 }
 
 // Osc online schema change 工具参数配置
@@ -522,7 +525,7 @@ type Ghost struct {
 	// e.g:
 	// -max-load Threads_connected=20,Connections=1500
 	// 指的是当MySQL中的状态值Threads_connected>20,Connections>1500的时候，gh-ost将采取节流(throttle)措施。
-	GhostMaxLoad string `toml:"ghost_max_load"`
+	// GhostMaxLoad string `toml:"ghost_max_load"`
 
 	GhostNiceRatio float64 `toml:"ghost_nice_ratio"`
 	// gh-ost的数据迁移(migrate)运行在从库上，而不是主库上。
@@ -569,6 +572,42 @@ type Ghost struct {
 	// 告诉gh-ost你正在运行的是一个tungsten-replication拓扑结构。
 	GhostTungsten            bool   `toml:"ghost_tungsten"`
 	GhostReplicationLagQuery string `toml:"ghost_replication_lag_query"`
+}
+
+type IncLevel struct {
+	ER_ALTER_TABLE_ONCE             int8 `toml:"er_alter_table_once"`
+	ER_AUTO_INCR_ID_WARNING         int8 `toml:"er_auto_incr_id_warning"`
+	ER_AUTOINC_UNSIGNED             int8 `toml:"er_autoinc_unsigned"`
+	ER_CHANGE_COLUMN_TYPE           int8 `toml:"er_change_column_type"`
+	ER_CHARSET_ON_COLUMN            int8 `toml:"er_charset_on_column"`
+	ER_COLUMN_HAVE_NO_COMMENT       int8 `toml:"er_column_have_no_comment"`
+	ER_FOREIGN_KEY                  int8 `toml:"er_foreign_key"`
+	ER_IDENT_USE_KEYWORD            int8 `toml:"er_ident_use_keyword"`
+	ER_INC_INIT_ERR                 int8 `toml:"er_inc_init_err"`
+	ER_INDEX_NAME_IDX_PREFIX        int8 `toml:"er_index_name_idx_prefix"`
+	ER_INDEX_NAME_UNIQ_PREFIX       int8 `toml:"er_index_name_uniq_prefix"`
+	ER_INVALID_DATA_TYPE            int8 `toml:"er_invalid_data_type"`
+	ER_INVALID_IDENT                int8 `toml:"er_invalid_ident"`
+	ER_NO_WHERE_CONDITION           int8 `toml:"er_no_where_condition"`
+	ER_NOT_ALLOWED_NULLABLE         int8 `toml:"er_not_allowed_nullable"`
+	ER_ORDERY_BY_RAND               int8 `toml:"er_ordery_by_rand"`
+	ER_PARTITION_NOT_ALLOWED        int8 `toml:"er_partition_not_allowed"`
+	ER_PK_COLS_NOT_INT              int8 `toml:"er_pk_cols_not_int"`
+	ER_SELECT_ONLY_STAR             int8 `toml:"er_select_only_star"`
+	ER_SET_DATA_TYPE_INT_BIGINT     int8 `toml:"er_set_data_type_int_bigint"`
+	ER_TABLE_MUST_HAVE_COMMENT      int8 `toml:"er_table_must_have_comment"`
+	ER_TABLE_MUST_HAVE_PK           int8 `toml:"er_table_must_have_pk"`
+	ER_TEXT_NOT_NULLABLE_ERROR      int8 `toml:"er_text_not_nullable_error"`
+	ER_TIMESTAMP_DEFAULT            int8 `toml:"er_timestamp_default"`
+	ER_TOO_MUCH_AUTO_TIMESTAMP_COLS int8 `toml:"er_too_much_auto_timestamp_cols"`
+	ER_USE_ENUM                     int8 `toml:"er_use_enum"`
+	ER_USE_TEXT_OR_BLOB             int8 `toml:"er_use_text_or_blob"`
+	ER_WITH_DEFAULT_ADD_COLUMN      int8 `toml:"er_with_default_add_column"`
+	ER_WITH_INSERT_FIELD            int8 `toml:"er_with_insert_field"`
+	ER_WITH_LIMIT_CONDITION         int8 `toml:"er_with_limit_condition"`
+	ER_WITH_ORDERBY_CONDITION       int8 `toml:"er_with_orderby_condition"`
+	ErCantChangeColumnPosition      int8 `toml:"er_cant_change_column_position"`
+	ErJsonTypeSupport               int8 `toml:"er_json_type_support"`
 }
 
 var defaultConf = Config{
@@ -704,6 +743,41 @@ var defaultConf = Config{
 		GhostDmlBatchSize:                  10,
 		GhostOkToDropTable:                 true,
 		GhostSkipForeignKeyChecks:          true,
+	},
+	IncLevel: IncLevel{
+		ER_ALTER_TABLE_ONCE:             1,
+		ER_AUTO_INCR_ID_WARNING:         1,
+		ER_AUTOINC_UNSIGNED:             1,
+		ER_CHANGE_COLUMN_TYPE:           1,
+		ER_CHARSET_ON_COLUMN:            1,
+		ER_COLUMN_HAVE_NO_COMMENT:       1,
+		ER_FOREIGN_KEY:                  2,
+		ER_IDENT_USE_KEYWORD:            1,
+		ER_INC_INIT_ERR:                 1,
+		ER_INDEX_NAME_IDX_PREFIX:        1,
+		ER_INDEX_NAME_UNIQ_PREFIX:       1,
+		ER_INVALID_DATA_TYPE:            1,
+		ER_INVALID_IDENT:                1,
+		ER_NO_WHERE_CONDITION:           1,
+		ER_NOT_ALLOWED_NULLABLE:         1,
+		ER_ORDERY_BY_RAND:               1,
+		ER_PARTITION_NOT_ALLOWED:        1,
+		ER_PK_COLS_NOT_INT:              1,
+		ER_SELECT_ONLY_STAR:             1,
+		ER_SET_DATA_TYPE_INT_BIGINT:     2,
+		ER_TABLE_MUST_HAVE_COMMENT:      1,
+		ER_TABLE_MUST_HAVE_PK:           1,
+		ER_TEXT_NOT_NULLABLE_ERROR:      1,
+		ER_TIMESTAMP_DEFAULT:            1,
+		ER_TOO_MUCH_AUTO_TIMESTAMP_COLS: 2,
+		ER_USE_ENUM:                     1,
+		ER_USE_TEXT_OR_BLOB:             2,
+		ER_WITH_DEFAULT_ADD_COLUMN:      1,
+		ER_WITH_INSERT_FIELD:            1,
+		ER_WITH_LIMIT_CONDITION:         1,
+		ER_WITH_ORDERBY_CONDITION:       1,
+		ErCantChangeColumnPosition:      1,
+		ErJsonTypeSupport:               2,
 	},
 }
 

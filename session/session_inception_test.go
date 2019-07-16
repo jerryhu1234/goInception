@@ -15,6 +15,8 @@ package session_test
 
 import (
 	"fmt"
+	"path"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -73,12 +75,18 @@ func (s *testSessionIncSuite) SetUpSuite(c *C) {
 	s.dom, err = session.BootstrapSession(s.store)
 	c.Assert(err, IsNil)
 
-	// config.GetGlobalConfig().Inc.Lang = "zh-CN"
-	// session.SetLanguage("zh-CN")
+	cfg := config.GetGlobalConfig()
+	_, localFile, _, _ := runtime.Caller(0)
+	localFile = path.Dir(localFile)
+	configFile := path.Join(localFile[0:len(localFile)-len("session")], "config/config.toml.example")
+	c.Assert(cfg.Load(configFile), IsNil)
+
 	config.GetGlobalConfig().Inc.Lang = "en-US"
 	config.GetGlobalConfig().Inc.EnableFingerprint = true
 	config.GetGlobalConfig().Inc.SqlSafeUpdates = 0
 	config.GetGlobalConfig().Inc.EnableDropTable = true
+	// 启用自定义审核级别
+	config.GetGlobalConfig().Inc.EnableLevel = true
 
 	session.SetLanguage("en-US")
 
@@ -111,6 +119,7 @@ func (s *testSessionIncSuite) TearDownTest(c *C) {
 	}()
 
 	config.GetGlobalConfig().Inc.EnableDropTable = true
+	session.CheckAuditSetting(config.GetGlobalConfig())
 
 	res := makeSQL(s.tk, "show tables")
 	c.Assert(int(s.tk.Se.AffectedRows()), Equals, 2)
@@ -245,6 +254,9 @@ func (s *testSessionIncSuite) getExplicitDefaultsForTimestamp(c *C) bool {
 }
 
 func makeSQL(tk *testkit.TestKit, sql string) *testkit.Result {
+
+	session.CheckAuditSetting(config.GetGlobalConfig())
+
 	a := `/*--user=test;--password=test;--host=127.0.0.1;--check=1;--backup=0;--port=3306;--enable-ignore-warnings;*/
 inception_magic_start;
 use test_inc;
@@ -255,6 +267,7 @@ inception_magic_commit;`
 
 func (s *testSessionIncSuite) execSQL(c *C, sql string) *testkit.Result {
 	config.GetGlobalConfig().Inc.EnableDropTable = true
+	session.CheckAuditSetting(config.GetGlobalConfig())
 	a := `/*--user=test;--password=test;--host=127.0.0.1;--execute=1;--backup=0;--port=3306;--enable-ignore-warnings;*/
 inception_magic_start;
 use test_inc;
@@ -273,6 +286,8 @@ func (s *testSessionIncSuite) testErrorCode(c *C, sql string, errors ...*session
 	if s.tk == nil {
 		s.tk = testkit.NewTestKitWithInit(c, s.store)
 	}
+
+	session.CheckAuditSetting(config.GetGlobalConfig())
 
 	res := makeSQL(s.tk, sql)
 	row := res.Rows()[int(s.tk.Se.AffectedRows())-1]
@@ -430,7 +445,6 @@ func (s *testSessionIncSuite) TestCreateTable(c *C) {
 		session.NewErr(session.ER_COLUMN_HAVE_NO_COMMENT, "c1", "t1"))
 
 	config.GetGlobalConfig().Inc.CheckColumnComment = false
-
 	// 表注释
 	config.GetGlobalConfig().Inc.CheckTableComment = true
 	res = makeSQL(tk, "create table t1(c1 varchar(20));")
@@ -648,6 +662,7 @@ func (s *testSessionIncSuite) TestCreateTable(c *C) {
 	}
 
 	config.GetGlobalConfig().Inc.EnableBlobType = false
+	config.GetGlobalConfig().Inc.CheckIndexPrefix = false
 	sql = "create table test_error_code_3(pt text ,primary key (pt));"
 	s.testErrorCode(c, sql,
 		session.NewErr(session.ER_USE_TEXT_OR_BLOB, "pt"),
@@ -798,6 +813,9 @@ primary key(id)) comment 'test';`
 
 	config.GetGlobalConfig().Inc.MustHaveColumns = ""
 
+	config.GetGlobalConfig().Inc.CheckInsertField = false
+	config.GetGlobalConfig().IncLevel.ER_WITH_INSERT_FIELD = 0
+
 	// 测试表名大小写
 	sql = `drop table if exists t1;CREATE TABLE t1(c1 int);insert into T1 values(1);`
 	s.testErrorCode(c, sql)
@@ -821,6 +839,36 @@ primary key(id)) comment 'test';`
 	res = makeSQL(tk, "drop table if exists t1;create table t1(c1 varchar(10))engine = innodb;")
 	row = res.Rows()[int(tk.Se.AffectedRows())-1]
 	c.Assert(row[2], Equals, "0")
+
+	// 允许blob,text,json列设置为NOT NULL
+	config.GetGlobalConfig().Inc.EnableBlobNotNull = false
+	sql = `create table t1(id int auto_increment primary key,c1 blob not null);`
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ER_TEXT_NOT_NULLABLE_ERROR, "c1", "t1"))
+
+	sql = `create table t1(id int auto_increment primary key,c1 text not null);`
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ER_TEXT_NOT_NULLABLE_ERROR, "c1", "t1"))
+	sql = `create table t1(id int auto_increment primary key,c1 json not null);`
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ER_TEXT_NOT_NULLABLE_ERROR, "c1", "t1"))
+
+	config.GetGlobalConfig().Inc.EnableBlobNotNull = true
+	sql = `create table t1(id int auto_increment primary key,c1 blob not null);`
+	s.testErrorCode(c, sql)
+
+	config.GetGlobalConfig().Inc.CheckIndexPrefix = true
+	sql = "create table test_error_code_3(a text, unique (a(3073)));"
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ER_WRONG_NAME_FOR_INDEX, "NULL", "test_error_code_3"),
+		session.NewErr(session.ER_INDEX_NAME_UNIQ_PREFIX, "", "test_error_code_3"),
+		session.NewErr(session.ER_TOO_LONG_KEY, "", indexMaxLength))
+
+	sql = "create table test_error_code_3(a text, key (a(3073)));"
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ER_WRONG_NAME_FOR_INDEX, "NULL", "test_error_code_3"),
+		session.NewErr(session.ER_INDEX_NAME_IDX_PREFIX, "", "test_error_code_3"),
+		session.NewErr(session.ER_TOO_LONG_KEY, "", indexMaxLength))
 
 }
 
@@ -1169,19 +1217,28 @@ func (s *testSessionIncSuite) TestAlterTableModifyColumn(c *C) {
 	config.GetGlobalConfig().Inc.CheckColumnPositionChange = true
 	sql = "create table t1(id int primary key,c1 int,c2 int);alter table t1 add column c3 int first"
 	s.testErrorCode(c, sql,
-		session.NewErr(session.ErrCantChangeColumnPosition, "t1.c3"))
+		session.NewErr(session.ErCantChangeColumnPosition, "t1.c3"))
 	sql = "create table t1(id int primary key,c1 int,c2 int);alter table t1 add column c3 int after c1"
 	s.testErrorCode(c, sql,
-		session.NewErr(session.ErrCantChangeColumnPosition, "t1.c3"))
+		session.NewErr(session.ErCantChangeColumnPosition, "t1.c3"))
 
 	sql = "create table t1(id int primary key,c1 int,c2 int);alter table t1 modify column c1 int after c2"
 	s.testErrorCode(c, sql,
-		session.NewErr(session.ErrCantChangeColumnPosition, "t1.c1"))
+		session.NewErr(session.ErCantChangeColumnPosition, "t1.c1"))
 	sql = "create table t1(id int primary key,c1 int,c2 int);alter table t1 change column c1 c3 int after id"
 	s.testErrorCode(c, sql,
-		session.NewErr(session.ErrCantChangeColumnPosition, "t1.c3"))
+		session.NewErr(session.ErCantChangeColumnPosition, "t1.c3"))
 
 	config.GetGlobalConfig().Inc.CheckColumnPositionChange = false
+
+	// modify column后,列信息更新
+	s.execSQL(c, "drop table if exists t1;create table t1(id int not null,c1 int);")
+	sql = "alter table t1 add primary key(id,c1);"
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ER_PRIMARY_CANT_HAVE_NULL))
+
+	sql = "alter table t1 modify c1 int not null;alter table t1 add primary key(id,c1);"
+	s.testErrorCode(c, sql)
 }
 
 func (s *testSessionIncSuite) TestAlterTableDropColumn(c *C) {
@@ -1215,6 +1272,7 @@ func (s *testSessionIncSuite) TestInsert(c *C) {
 	}()
 
 	config.GetGlobalConfig().Inc.CheckInsertField = false
+	config.GetGlobalConfig().IncLevel.ER_WITH_INSERT_FIELD = 0
 
 	// 表不存在
 	sql = "insert into t1 values(1,1);"
@@ -1245,10 +1303,12 @@ func (s *testSessionIncSuite) TestInsert(c *C) {
 
 	// 字段警告
 	config.GetGlobalConfig().Inc.CheckInsertField = true
+	config.GetGlobalConfig().IncLevel.ER_WITH_INSERT_FIELD = 1
 	sql = "create table t1(id int,c1 int);insert into t1 values(1,1);"
 	s.testErrorCode(c, sql,
 		session.NewErr(session.ER_WITH_INSERT_FIELD))
 	config.GetGlobalConfig().Inc.CheckInsertField = false
+	config.GetGlobalConfig().IncLevel.ER_WITH_INSERT_FIELD = 0
 
 	sql = "create table t1(id int,c1 int);insert into t1(id) values();"
 	s.testErrorCode(c, sql,
@@ -1406,6 +1466,11 @@ insert into t2 select id from t1;`
 	s.testErrorCode(c, sql,
 		session.NewErr(session.ER_COLUMN_NOT_EXISTED, "id1"))
 
+	sql = `drop table if exists tt1;create table tt1(id int,c1 int);
+	drop table if exists t1;create table t1(id int primary key,c1 int);
+	insert into tt1(id)
+		select s1.id from t1 as s1 inner join t1 as s2 on s1.c1 = s2.c1 where s1.id > s2.id;`
+	s.testErrorCode(c, sql)
 }
 
 func (s *testSessionIncSuite) TestUpdate(c *C) {
@@ -1416,12 +1481,20 @@ func (s *testSessionIncSuite) TestUpdate(c *C) {
 	}()
 
 	config.GetGlobalConfig().Inc.CheckInsertField = false
+	config.GetGlobalConfig().IncLevel.ER_WITH_INSERT_FIELD = 0
 	config.GetGlobalConfig().Inc.EnableSetEngine = true
 
 	// 表不存在
 	sql = "update t1 set c1 = 1;"
 	s.testErrorCode(c, sql,
 		session.NewErr(session.ER_TABLE_NOT_EXISTED_ERROR, "test_inc.t1"))
+
+	sql = "create table t1(id int);update t1 as tmp set tmp.id = 1;"
+	s.testErrorCode(c, sql)
+
+	sql = "create table t1(id int);update t1 as tmp set t1.id = 1;"
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ER_COLUMN_NOT_EXISTED, "t1.id"))
 
 	sql = "create table t1(id int);update t1 set c1 = 1;"
 	s.testErrorCode(c, sql,
@@ -1430,6 +1503,10 @@ func (s *testSessionIncSuite) TestUpdate(c *C) {
 	sql = "create table t1(id int,c1 int);update t1 set c1 = 1,c2 = 1;"
 	s.testErrorCode(c, sql,
 		session.NewErr(session.ER_COLUMN_NOT_EXISTED, "t1.c2"))
+
+	sql = `create table t1(id int primary key,c1 int);
+		update t1 s1 inner join t1 s2 on s1.id=s2.id set s1.c1=s2.c1 where s1.c1=1;`
+	s.testErrorCode(c, sql)
 
 	sql = `create table t1(id int primary key,c1 int);
 		create table t2(id int primary key,c1 int,c2 int);
@@ -1559,6 +1636,7 @@ WHERE tt1.id=1;`
 	} else {
 		s.testErrorCode(c, sql)
 	}
+
 }
 
 func (s *testSessionIncSuite) TestDelete(c *C) {
@@ -1569,6 +1647,7 @@ func (s *testSessionIncSuite) TestDelete(c *C) {
 	}()
 
 	config.GetGlobalConfig().Inc.CheckInsertField = false
+	config.GetGlobalConfig().IncLevel.ER_WITH_INSERT_FIELD = 0
 
 	// 表不存在
 	sql = "delete from t1 where c1 = 1;"
@@ -1636,6 +1715,20 @@ func (s *testSessionIncSuite) TestDelete(c *C) {
 	sql = `delete from t1 where id =1;`
 	s.testErrorCode(c, sql)
 	s.testAffectedRows(c, 1)
+
+	sql = `drop table if exists t1;create table t1(id int primary key,c1 int);
+		delete tmp from t1 as tmp where tmp.id=1;`
+	s.testErrorCode(c, sql)
+
+	sql = `drop table if exists t1;create table t1(id int primary key,c1 int);
+		delete t1 from t1 as tmp where tmp.id=1;`
+	s.testErrorCode(c, sql,
+		session.NewErr(session.ER_TABLE_NOT_EXISTED_ERROR, "test_inc.t1"))
+
+	sql = `drop table if exists t1;create table t1(id int primary key,c1 int);
+		delete s1 from t1 as s1 inner join t1 as s2 on s1.c1 = s2.c1 where s1.id > s2.id;`
+	s.testErrorCode(c, sql)
+
 }
 
 func (s *testSessionIncSuite) TestCreateDataBase(c *C) {
@@ -1865,6 +1958,22 @@ func (s *testSessionIncSuite) TestAlterTableAddIndex(c *C) {
 	s.testErrorCode(c, sql,
 		session.NewErr(session.ER_DUP_INDEX, "idx", "test_inc", "t1"))
 
+	if s.getDBVersion(c) >= 50701 {
+		sql = "create table t1(id int,c1 int);alter table t1 add index idx (c1);alter table t1 rename index idx to idx2;"
+		s.testErrorCode(c, sql)
+
+		sql = `create table t1(id int,c1 int);
+		alter table t1 add index idx (c1),add index idx2 (c1);
+		alter table t1 rename index idx to idx2;`
+		s.testErrorCode(c, sql,
+			session.NewErr(session.ER_DUP_KEYNAME, "idx2"))
+
+		sql = `create table t1(id int,c1 int);
+		alter table t1 add index idx (c1),add index idx2 (c1);
+		alter table t1 rename index idx3 to idx2;`
+		s.testErrorCode(c, sql,
+			session.NewErr(session.ER_CANT_DROP_FIELD_OR_KEY, "t1.idx3"))
+	}
 }
 
 func (s *testSessionIncSuite) TestAlterTableDropIndex(c *C) {

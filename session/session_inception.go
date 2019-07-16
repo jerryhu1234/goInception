@@ -301,6 +301,9 @@ func (s *session) ExecuteInc(ctx context.Context, sql string) (recordSets []ast.
 	s.Osc = config.GetGlobalConfig().Osc
 	s.Ghost = config.GetGlobalConfig().Ghost
 
+	// 自定义审核级别,通过解析config.GetGlobalConfig().IncLevel生成
+	s.parseIncLevel()
+
 	s.sqlFingerprint = nil
 
 	// 全量日志
@@ -323,6 +326,8 @@ func (s *session) ExecuteInc(ctx context.Context, sql string) (recordSets []ast.
 		s.backupDBCacheList = nil
 		s.backupTableCacheList = nil
 		s.sqlFingerprint = nil
+
+		s.incLevel = nil
 	}()
 	// pprof.StopCPUProfile()
 
@@ -330,7 +335,6 @@ func (s *session) ExecuteInc(ctx context.Context, sql string) (recordSets []ast.
 }
 
 func (s *session) executeInc(ctx context.Context, sql string) (recordSets []ast.RecordSet, err error) {
-
 	sqlList := strings.Split(sql, "\n")
 
 	defer func() {
@@ -379,7 +383,8 @@ func (s *session) executeInc(ctx context.Context, sql string) (recordSets []ast.
 		// 如果以分号结尾,或者是最后一行,就做解析
 		// strings.HasSuffix(sql_line, ";")
 		// && batchSize >= 100)
-		if strings.HasSuffix(sql_line, ";") || i == lineCount {
+
+		if strings.HasSuffix(sql_line, ";") || i == lineCount || strings.HasSuffix(sql_line, ";\r") {
 			// batchSize = 1
 			buf = append(buf, sql_line)
 			s1 := strings.Join(buf, "\n")
@@ -713,6 +718,8 @@ func (s *session) processCommand(ctx context.Context, stmtNode ast.StmtNode,
 				return s.executeLocalShowVariables(node)
 			case ast.ShowProcessList:
 				return s.executeLocalShowProcesslist(node)
+			case ast.ShowLevels:
+				return s.executeLocalShowLevels(node)
 			default:
 				log.Infof("%#v", node)
 				return nil, errors.New("不支持的语法类型")
@@ -2250,7 +2257,7 @@ func (s *session) parseOptions(sql string) {
 
 	// 不再检查密码是否为空
 	if s.opt.host == "" || s.opt.port == 0 || s.opt.user == "" {
-		log.Warning(s.opt)
+		log.Warningf("%#v", s.opt)
 		s.AppendErrorNo(ER_SQL_INVALID_SOURCE)
 		return
 	}
@@ -2325,6 +2332,31 @@ func (s *session) parseOptions(sql string) {
 	}
 
 	s.setSqlSafeUpdates()
+}
+
+func (s *session) parseIncLevel() {
+	obj := config.GetGlobalConfig().IncLevel
+	t := reflect.TypeOf(obj)
+	v := reflect.ValueOf(obj)
+	s.incLevel = make(map[string]uint8, v.NumField())
+
+	for i := 0; i < v.NumField(); i++ {
+		if v.Field(i).CanInterface() {
+			a := v.Field(i).Int()
+			if a < 0 {
+				a = 0
+			} else if a > 2 {
+				a = 2
+			}
+			if k := t.Field(i).Tag.Get("toml"); k != "" {
+				s.incLevel[k] = uint8(a)
+			} else {
+				s.incLevel[t.Field(i).Name] = uint8(a)
+			}
+		}
+	}
+
+	// log.Infof("%#v", s.incLevel)
 }
 
 func (s *session) checkTruncateTable(node *ast.TruncateTableStmt, sql string) {
@@ -2966,7 +2998,6 @@ func (s *session) checkAlterTable(node *ast.AlterTableStmt, sql string) {
 		return
 	}
 
-	// table := s.getTableFromCache(node.Table.Schema.O, node.Table.Name.O, true)
 	table := s.getTableFromCache(node.Table.Schema.O, node.Table.Name.O, true)
 	if table == nil {
 		return
@@ -3062,6 +3093,13 @@ func (s *session) checkAlterTable(node *ast.AlterTableStmt, sql string) {
 		case ast.AlterTableAlterColumn:
 			s.checkAlterTableAlterColumn(table, alter)
 
+		case ast.AlterTableRenameIndex:
+			if s.DBVersion < 50701 {
+				s.AppendErrorNo(ER_NOT_SUPPORTED_YET)
+			} else {
+				s.checkAlterTableRenameIndex(table, alter)
+			}
+
 		case ast.AlterTableLock,
 			ast.AlterTableAlgorithm,
 			ast.AlterTableForce:
@@ -3136,7 +3174,62 @@ func (s *session) checkAlterTableAlterColumn(t *TableInfo, c *ast.AlterTableSpec
 
 		}
 	}
+}
 
+func (s *session) checkAlterTableRenameIndex(t *TableInfo, c *ast.AlterTableSpec) {
+
+	indexName := c.FromKey.String()
+	newIndexName := c.ToKey.String()
+
+	if len(t.Indexes) == 0 {
+		s.AppendErrorNo(ER_CANT_DROP_FIELD_OR_KEY, fmt.Sprintf("%s.%s", t.Name, indexName))
+		return
+	}
+
+	var foundRows []*IndexInfo
+	for _, row := range t.Indexes {
+		if row.IndexName == indexName && !row.IsDeleted {
+			foundRows = append(foundRows, row)
+			row.IsDeleted = true
+		}
+	}
+
+	if len(foundRows) == 0 {
+		s.AppendErrorNo(ER_CANT_DROP_FIELD_OR_KEY, fmt.Sprintf("%s.%s", t.Name, indexName))
+		return
+	}
+
+	found := false
+	for _, row := range t.Indexes {
+		if row.IndexName == newIndexName && !row.IsDeleted {
+			found = true
+			break
+		}
+	}
+
+	if found {
+		s.AppendErrorNo(ER_DUP_KEYNAME, newIndexName)
+	}
+
+	if !s.hasError() {
+		// cache new index
+		for _, index := range foundRows {
+			index := &IndexInfo{
+				Table:      t.Name,
+				NonUnique:  index.NonUnique,
+				IndexName:  newIndexName,
+				Seq:        index.Seq,
+				ColumnName: index.ColumnName,
+				IndexType:  index.IndexType,
+			}
+			t.Indexes = append(t.Indexes, index)
+		}
+		if s.opt.execute {
+			rollback := fmt.Sprintf("RENAME INDEX `%s` TO `%s`,",
+				newIndexName, c.FromKey.String())
+			s.myRecord.DDLRollback += rollback
+		}
+	}
 }
 
 func (s *session) checkAlterTableRenameTable(t *TableInfo, c *ast.AlterTableSpec) {
@@ -3211,11 +3304,13 @@ func (s *session) checkModifyColumn(t *TableInfo, c *ast.AlterTableSpec) {
 
 				if c.Position.Tp != ast.ColumnPositionNone {
 
-					s.AppendErrorNo(ErrCantChangeColumnPosition,
+					s.AppendErrorNo(ErCantChangeColumnPosition,
 						fmt.Sprintf("%s.%s", t.Name, nc.Name.Name))
 
 					// 在新的快照上变更表结构
 					t := s.cacheTableSnapshot(t)
+
+					t.Fields[foundIndexOld] = *(s.buildNewColumnToCache(t, nc))
 
 					if c.Position.Tp == ast.ColumnPositionFirst {
 						tmp := make([]FieldInfo, 0, len(t.Fields))
@@ -3260,6 +3355,8 @@ func (s *session) checkModifyColumn(t *TableInfo, c *ast.AlterTableSpec) {
 							t.Fields = tmp
 						}
 					}
+				} else {
+					t.Fields[foundIndexOld] = *(s.buildNewColumnToCache(t, nc))
 				}
 
 				if s.opt.execute {
@@ -3319,13 +3416,14 @@ func (s *session) checkModifyColumn(t *TableInfo, c *ast.AlterTableSpec) {
 				// 在新的快照上变更表结构
 				t := s.cacheTableSnapshot(t)
 
-				t.Fields[foundIndexOld].Field = nc.Name.Name.O
+				// t.Fields[foundIndexOld].Field = nc.Name.Name.O
+				t.Fields[foundIndexOld] = *(s.buildNewColumnToCache(t, nc))
 				// 修改列名后标记有新列
 				t.IsNewColumns = true
 
 				if c.Position.Tp != ast.ColumnPositionNone {
 
-					s.AppendErrorNo(ErrCantChangeColumnPosition,
+					s.AppendErrorNo(ErCantChangeColumnPosition,
 						fmt.Sprintf("%s.%s", t.Name, nc.Name.Name))
 
 					if c.Position.Tp == ast.ColumnPositionFirst {
@@ -3844,7 +3942,7 @@ func (s *session) checkAddColumn(t *TableInfo, c *ast.AlterTableSpec) {
 			}
 
 			if c.Position != nil && c.Position.Tp != ast.ColumnPositionNone {
-				s.AppendErrorNo(ErrCantChangeColumnPosition,
+				s.AppendErrorNo(ErCantChangeColumnPosition,
 					fmt.Sprintf("%s.%s", t.Name, nc.Name.Name))
 			}
 
@@ -4354,10 +4452,17 @@ func (s *session) checkInsert(node *ast.InsertStmt, sql string) {
 
 				t := s.getTableFromCache(tblName.Schema.O, tblName.Name.O, true)
 				if t != nil {
+					// if tblSource.AsName.L != "" {
+					// 	t.AsName = tblSource.AsName.O
+					// }
+					// tableInfoList = append(tableInfoList, t)
+
 					if tblSource.AsName.L != "" {
 						t.AsName = tblSource.AsName.O
+						tableInfoList = append(tableInfoList, s.copyTableInfo(t))
+					} else {
+						tableInfoList = append(tableInfoList, t)
 					}
-					tableInfoList = append(tableInfoList, t)
 					if t.IsNew {
 						haveNewTable = true
 					}
@@ -4697,6 +4802,14 @@ func (s *session) executeInceptionSet(node *ast.InceptionSetStmt, sql string) ([
 
 		cnf := config.GetGlobalConfig()
 
+		if v.IsLevel {
+			err := s.setLevelValue(reflect.TypeOf(cnf.IncLevel), reflect.ValueOf(&cnf.IncLevel).Elem(), v.Name, value)
+			if err != nil {
+				return nil, err
+			}
+			continue
+		}
+
 		// t := reflect.TypeOf(cnf.Inc)
 		// values := reflect.ValueOf(&cnf.Inc).Elem()
 		prefix := strings.ToLower(v.Name)
@@ -4738,6 +4851,29 @@ func (s *session) setVariableValue(t reflect.Type, values reflect.Value,
 	// t := reflect.TypeOf(*(obj))
 	// // values := reflect.ValueOf(obj).Elem()
 	// values := reflect.ValueOf(obj).Elem()
+
+	found := false
+	for i := 0; i < values.NumField(); i++ {
+		if values.Field(i).CanInterface() { //判断是否为可导出字段
+			if k := t.Field(i).Tag.Get("toml"); strings.EqualFold(k, name) ||
+				strings.EqualFold(t.Field(i).Name, name) {
+				err := s.setConfigValue(name, values.Field(i), &(value.Datum))
+				if err != nil {
+					return err
+				}
+				found = true
+				break
+			}
+		}
+	}
+	if !found {
+		return errors.New("无效参数")
+	}
+	return nil
+}
+
+func (s *session) setLevelValue(t reflect.Type, values reflect.Value,
+	name string, value *ast.ValueExpr) error {
 
 	found := false
 	for i := 0; i < values.NumField(); i++ {
@@ -4814,7 +4950,8 @@ func (s *session) setConfigValue(name string, field reflect.Value, value *types.
 	case reflect.String.String():
 		field.SetString(sVal)
 
-	case reflect.Uint.String():
+	case reflect.Uint.String(), reflect.Uint8.String(), reflect.Uint16.String(),
+		reflect.Uint32.String(), reflect.Uint64.String():
 		// field.SetUint(value.GetUint64())
 		v, err := s.checkUInt64SystemVar(name, sVal, 0, math.MaxUint64)
 		if err != nil {
@@ -4824,8 +4961,8 @@ func (s *session) setConfigValue(name string, field reflect.Value, value *types.
 		v1, _ := strconv.ParseUint(v, 10, 64)
 		field.SetUint(v1)
 
-	case reflect.Int.String(), reflect.Int64.String():
-		// field.SetInt(value.GetInt64())
+	case reflect.Int.String(), reflect.Int8.String(), reflect.Int16.String(),
+		reflect.Int32.String(), reflect.Int64.String():
 		v, err := s.checkInt64SystemVar(name, sVal, math.MinInt64, math.MaxInt64)
 		if err != nil {
 			return err
@@ -4919,7 +5056,6 @@ func (s *session) executeLocalShowVariables(node *ast.ShowStmt) ([]ast.RecordSet
 	s.sessionVars.StmtCtx.AddAffectedRows(uint64(res.rc.count))
 
 	return res.Rows(), nil
-
 }
 
 func (s *session) executeLocalShowProcesslist(node *ast.ShowStmt) ([]ast.RecordSet, error) {
@@ -4964,6 +5100,193 @@ func (s *session) executeLocalShowProcesslist(node *ast.ShowStmt) ([]ast.RecordS
 	return res.Rows(), nil
 }
 
+// splitWhere: 拆分where表达式
+func splitWhere(where ast.ExprNode) []ast.ExprNode {
+	var conditions []ast.ExprNode
+	switch x := where.(type) {
+	case nil:
+	case *ast.BinaryOperationExpr:
+		if x.Op == opcode.LogicAnd {
+			conditions = append(conditions, splitWhere(x.L)...)
+			conditions = append(conditions, splitWhere(x.R)...)
+		} else {
+			conditions = append(conditions, x)
+		}
+	case *ast.ParenthesesExpr:
+		conditions = append(conditions, splitWhere(x.Expr)...)
+	default:
+		conditions = append(conditions, where)
+	}
+	return conditions
+}
+
+// checkColumnName: 检查列是否存在
+func checkColumnName(expr ast.ExprNode, colNames []string) (colIndex int, err error) {
+	colIndex = -1
+	if e, ok := expr.(*ast.ColumnNameExpr); ok {
+		found := false
+		for i, c := range colNames {
+			if e.Name.Name.L == c {
+				found = true
+				colIndex = i
+			}
+		}
+		if !found {
+			return colIndex, errors.New(fmt.Sprintf(GetErrorMessage(ER_COLUMN_NOT_EXISTED), e.Name.Name.String()))
+		}
+	}
+	return colIndex, nil
+}
+
+// filterExprNode: 条件筛选
+func filterExprNode(expr ast.ExprNode, colNames []string, values []string) (bool, error) {
+	switch x := expr.(type) {
+	case *ast.BinaryOperationExpr:
+		switch x.Op {
+		case opcode.EQ:
+			colIndex, err := checkColumnName(x.L, colNames)
+			if err != nil {
+				return false, err
+			}
+			if colIndex > -1 {
+				if v, ok := x.R.(*ast.ValueExpr); ok {
+					sVal, _ := v.ToString()
+					if sVal == values[colIndex] {
+						return true, nil
+					}
+				}
+			}
+		default:
+			log.Info(x)
+			return false, errors.New("不支持的操作")
+		}
+	case *ast.PatternLikeExpr:
+		colIndex, err := checkColumnName(x.Expr, colNames)
+		if err != nil {
+			return false, err
+		}
+		if colIndex > -1 {
+			if v, ok := x.Pattern.(*ast.ValueExpr); ok {
+				like := strings.ToLower(v.GetString())
+				patChars, patTypes := stringutil.CompilePattern(like, x.Escape)
+				match := stringutil.DoMatch(strings.ToLower(values[colIndex]), patChars, patTypes)
+				if match && !x.Not {
+					return true, nil
+				} else if !match && x.Not {
+					return true, nil
+				}
+			}
+		}
+
+	default:
+		log.Info(x)
+		return false, errors.New("不支持的操作")
+	}
+	return false, nil
+}
+
+// filter: 条件筛选
+func filter(expr []ast.ExprNode, colNames []string, value []string) (bool, error) {
+	for _, e := range expr {
+		ok, err := filterExprNode(e, colNames, value)
+		if err != nil {
+			return false, err
+		}
+		if !ok {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (s *session) executeLocalShowLevels(node *ast.ShowStmt) ([]ast.RecordSet, error) {
+	log.Debug("executeLocalShowLevels")
+
+	res := NewLevelSets(len(s.incLevel))
+
+	filters := make([]ast.ExprNode, 0)
+	if node.Where != nil {
+		filters = splitWhere(node.Where)
+	}
+
+	if node.Pattern != nil {
+		if node.Pattern.Expr == nil {
+			node.Pattern.Expr = &ast.ColumnNameExpr{
+				Name: &ast.ColumnName{Name: model.NewCIStr("name")},
+			}
+		}
+		filters = append(filters, node.Pattern)
+	}
+
+	names := []string{"name", "value", "desc"}
+
+	for i := 1; i < len(ErrorsDefault); i++ {
+		code := ErrorCode(i)
+		name := code.String()
+		if v, ok := s.incLevel[name]; ok {
+			if len(filters) > 0 {
+				ok, err := filter(filters, names, []string{
+					name, strconv.Itoa(int(v)), GetErrorMessage(code),
+				})
+				if err != nil {
+					return nil, err
+				}
+				if !ok {
+					continue
+				}
+			}
+			res.Append(name, int64(v), GetErrorMessage(code))
+
+			// if len(like) == 0 {
+			// 	if len(filters) > 0 {
+			// 		ok, err := filter(filters, names, []string{
+			// 			name, string(v), GetErrorMessage(code),
+			// 		})
+			// 		if err != nil {
+			// 			return nil, err
+			// 		}
+			// 		if !ok {
+			// 			continue
+			// 		}
+			// 	}
+
+			// 	res.Append(name, int64(v), GetErrorMessage(code))
+			// } else {
+			// 	match := stringutil.DoMatch(name, patChars, patTypes)
+			// 	if match && !node.Pattern.Not {
+			// 		if len(filters) > 0 {
+			// 			ok, err := filter(filters, names, []string{
+			// 				name, string(v), GetErrorMessage(code),
+			// 			})
+			// 			if err != nil {
+			// 				return nil, err
+			// 			}
+			// 			if !ok {
+			// 				continue
+			// 			}
+			// 		}
+			// 		res.Append(name, int64(v), GetErrorMessage(code))
+			// 	} else if !match && node.Pattern.Not {
+			// 		if len(filters) > 0 {
+			// 			ok, err := filter(filters, names, []string{
+			// 				name, string(v), GetErrorMessage(code),
+			// 			})
+			// 			if err != nil {
+			// 				return nil, err
+			// 			}
+			// 			if !ok {
+			// 				continue
+			// 			}
+			// 		}
+			// 		res.Append(name, int64(v), GetErrorMessage(code))
+			// 	}
+			// }
+		}
+	}
+
+	s.sessionVars.StmtCtx.AddAffectedRows(uint64(res.rc.count))
+	return res.Rows(), nil
+}
 func (s *session) executeLocalShowOscProcesslist(node *ast.ShowOscStmt) ([]ast.RecordSet, error) {
 	pl := s.sessionManager.ShowOscProcessList()
 
@@ -5436,7 +5759,8 @@ func (s *session) checkUpdate(node *ast.UpdateStmt, sql string) {
 						break
 					}
 				}
-			} else if originTable == tblName.Name.L || originTable == tblSource.AsName.L {
+			} else if originTable == tblSource.AsName.L ||
+				(tblSource.AsName.L == "" && originTable == tblName.Name.L) {
 				s.myRecord.TableInfo = t
 			}
 		}
@@ -5444,8 +5768,10 @@ func (s *session) checkUpdate(node *ast.UpdateStmt, sql string) {
 		if t != nil {
 			if tblSource.AsName.L != "" {
 				t.AsName = tblSource.AsName.O
+				tableInfoList = append(tableInfoList, s.copyTableInfo(t))
+			} else {
+				tableInfoList = append(tableInfoList, t)
 			}
-			tableInfoList = append(tableInfoList, t)
 			if t.IsNew {
 				haveNewTable = true
 			}
@@ -5634,15 +5960,6 @@ func (s *session) checkFieldItem(name *ast.ColumnName, tables []*TableInfo) bool
 		}
 	}
 
-	// log.Info(name.Name, "--------", found)
-	// for _, t := range tables {
-	// 	log.Info(t.AsName, ",", t.Name)
-	// 	for _, f := range t.Fields {
-	// 		fmt.Print(f.Field, " ")
-	// 	}
-	// 	fmt.Println()
-	// }
-
 	if found {
 		return true
 	} else {
@@ -5702,13 +6019,6 @@ func (s *session) checkDelete(node *ast.DeleteStmt, sql string) {
 	// 	return
 	// }
 
-	if node.Tables != nil {
-		for _, a := range node.Tables.Tables {
-			s.myRecord.TableInfo = s.getTableFromCache(a.Schema.O, a.Name.O, true)
-			break
-		}
-	}
-
 	var tableList []*ast.TableSource
 	tableList = extractTableList(node.TableRefs.TableRefs, tableList)
 
@@ -5720,11 +6030,43 @@ func (s *session) checkDelete(node *ast.DeleteStmt, sql string) {
 		if t != nil {
 			if tblSource.AsName.L != "" {
 				t.AsName = tblSource.AsName.O
+				tableInfoList = append(tableInfoList, s.copyTableInfo(t))
+			} else {
+				tableInfoList = append(tableInfoList, t)
 			}
-			tableInfoList = append(tableInfoList, t)
 
-			if s.myRecord.TableInfo == nil {
+			if node.Tables == nil && s.myRecord.TableInfo == nil {
 				s.myRecord.TableInfo = t
+			}
+		}
+	}
+
+	if node.Tables != nil {
+		for _, name := range node.Tables.Tables {
+			found := false
+			db := name.Schema.String()
+			for i, t := range tableInfoList {
+				var tName string
+				if t.AsName != "" {
+					tName = t.AsName
+				} else {
+					tName = t.Name
+				}
+				if name.Name.L != "" && (db == "" || strings.EqualFold(t.Schema, db)) &&
+					(strings.EqualFold(tName, name.Name.L)) {
+					if s.myRecord.TableInfo == nil {
+						s.myRecord.TableInfo = tableInfoList[i]
+					}
+					found = true
+					break
+				}
+			}
+			if !found {
+				if db == "" {
+					db = s.DBName
+				}
+				s.AppendErrorNo(ER_TABLE_NOT_EXISTED_ERROR,
+					fmt.Sprintf("%s.%s", db, name.Name))
 			}
 		}
 	}
@@ -5822,7 +6164,7 @@ func (r *Record) AppendErrorMessage(msg string) {
 	r.Buf.WriteString("\n")
 }
 
-func (r *Record) AppendErrorNo(number int, values ...interface{}) {
+func (r *Record) AppendErrorNo(number ErrorCode, values ...interface{}) {
 	r.ErrLevel = uint8(Max(int(r.ErrLevel), int(GetErrorLevel(number))))
 
 	if len(values) == 0 {
@@ -5834,7 +6176,7 @@ func (r *Record) AppendErrorNo(number int, values ...interface{}) {
 }
 
 // AppendWarning 添加警告. 错误级别指定为警告
-func (r *Record) AppendWarning(number int, values ...interface{}) {
+func (r *Record) AppendWarning(number ErrorCode, values ...interface{}) {
 	r.ErrLevel = uint8(Max(int(r.ErrLevel), 1))
 
 	if len(values) == 0 {
@@ -5857,7 +6199,7 @@ func (s *session) AppendErrorMessage(msg string) {
 	s.myRecord.AppendErrorMessage(msg)
 }
 
-func (s *session) AppendWarning(number int, values ...interface{}) {
+func (s *session) AppendWarning(number ErrorCode, values ...interface{}) {
 	if s.stage == StageBackup {
 		s.myRecord.Buf.WriteString("Backup: ")
 	} else if s.stage == StageExec {
@@ -5867,15 +6209,42 @@ func (s *session) AppendWarning(number int, values ...interface{}) {
 	s.recordSets.MaxLevel = uint8(Max(int(s.recordSets.MaxLevel), int(s.myRecord.ErrLevel)))
 }
 
-func (s *session) AppendErrorNo(number int, values ...interface{}) {
-	if s.checkInceptionVariables(number) {
-		if s.stage == StageBackup {
-			s.myRecord.Buf.WriteString("Backup: ")
-		} else if s.stage == StageExec {
-			s.myRecord.Buf.WriteString("Execute: ")
+func (s *session) AppendErrorNo(number ErrorCode, values ...interface{}) {
+	r := s.myRecord
+	if s.Inc.EnableLevel {
+		var level uint8 = 2
+		found := false
+		if v, ok := s.incLevel[number.String()]; ok {
+			level = v
+			found = true
+		} else {
+			level = GetErrorLevel(number)
 		}
-		s.myRecord.AppendErrorNo(number, values...)
-		s.recordSets.MaxLevel = uint8(Max(int(s.recordSets.MaxLevel), int(s.myRecord.ErrLevel)))
+		if (found && level > 0) || (!found && s.checkInceptionVariables(number)) {
+			r.ErrLevel = uint8(Max(int(r.ErrLevel), int(level)))
+			s.recordSets.MaxLevel = uint8(Max(int(s.recordSets.MaxLevel), int(s.myRecord.ErrLevel)))
+			if s.stage == StageBackup {
+				r.Buf.WriteString("Backup: ")
+			} else if s.stage == StageExec {
+				r.Buf.WriteString("Execute: ")
+			}
+			if len(values) == 0 {
+				r.Buf.WriteString(GetErrorMessage(number))
+			} else {
+				r.Buf.WriteString(fmt.Sprintf(GetErrorMessage(number), values...))
+			}
+			r.Buf.WriteString("\n")
+		}
+	} else {
+		if s.checkInceptionVariables(number) {
+			if s.stage == StageBackup {
+				r.Buf.WriteString("Backup: ")
+			} else if s.stage == StageExec {
+				r.Buf.WriteString("Execute: ")
+			}
+			s.myRecord.AppendErrorNo(number, values...)
+			s.recordSets.MaxLevel = uint8(Max(int(s.recordSets.MaxLevel), int(s.myRecord.ErrLevel)))
+		}
 	}
 }
 
@@ -5891,7 +6260,7 @@ func (s *session) checkKeyWords(name string) {
 	}
 }
 
-func (s *session) checkInceptionVariables(number int) bool {
+func (s *session) checkInceptionVariables(number ErrorCode) bool {
 	switch number {
 	case ER_WITH_INSERT_FIELD:
 		return s.Inc.CheckInsertField
@@ -5991,8 +6360,11 @@ func (s *session) checkInceptionVariables(number int) bool {
 	case ER_CHANGE_COLUMN_TYPE:
 		return s.Inc.CheckColumnTypeChange
 
-	case ErrCantChangeColumnPosition:
+	case ErCantChangeColumnPosition:
 		return s.Inc.CheckColumnPositionChange
+
+	case ER_TEXT_NOT_NULLABLE_ERROR:
+		return !s.Inc.EnableBlobNotNull
 		/*case ER_NULL_NAME_FOR_INDEX:
 		  return s.Inc.EnableNullIndexName*/
 	}
@@ -6191,6 +6563,7 @@ func (s *session) copyTableInfo(t *TableInfo) *TableInfo {
 
 	p.Schema = t.Schema
 	p.Name = t.Name
+	p.AsName = t.AsName
 
 	p.Fields = make([]FieldInfo, len(t.Fields))
 	copy(p.Fields, t.Fields)
@@ -6279,8 +6652,12 @@ func (s *session) checkSelectItem(node ast.ResultSetNode) []*TableInfo {
 		case *ast.TableName:
 			t := s.getTableFromCache(tblSource.Schema.O, tblSource.Name.O, true)
 			if t != nil {
-				t.AsName = x.AsName.O
-				return []*TableInfo{t}
+				if x.AsName.L != "" {
+					t.AsName = x.AsName.O
+					return []*TableInfo{s.copyTableInfo(t)}
+				} else {
+					return []*TableInfo{t}
+				}
 			} else {
 				return nil
 			}
@@ -6337,10 +6714,17 @@ func (s *session) checkSubSelectItem(node *ast.SelectStmt) []*TableInfo {
 			tblName := x
 			t := s.getTableFromCache(tblName.Schema.O, tblName.Name.O, true)
 			if t != nil {
+				// if tblSource.AsName.L != "" {
+				// 	t.AsName = tblSource.AsName.O
+				// }
+				// tableInfoList = append(tableInfoList, t)
+
 				if tblSource.AsName.L != "" {
 					t.AsName = tblSource.AsName.O
+					tableInfoList = append(tableInfoList, s.copyTableInfo(t))
+				} else {
+					tableInfoList = append(tableInfoList, t)
 				}
-				tableInfoList = append(tableInfoList, t)
 			}
 		case *ast.SelectStmt:
 			// 递归审核子查询
@@ -6435,8 +6819,15 @@ func (s *session) getTableInfoByTableSource(tableList []*ast.TableSource) (table
 			tblName := x
 			t := s.getTableFromCache(tblName.Schema.O, tblName.Name.O, true)
 			if t != nil {
-				t.AsName = tblSource.AsName.O
-				tableInfoList = append(tableInfoList, t)
+				// t.AsName = tblSource.AsName.O
+				// tableInfoList = append(tableInfoList, t)
+
+				if tblSource.AsName.L != "" {
+					t.AsName = tblSource.AsName.O
+					tableInfoList = append(tableInfoList, s.copyTableInfo(t))
+				} else {
+					tableInfoList = append(tableInfoList, t)
+				}
 			}
 		case *ast.SelectStmt:
 			cols := s.getSubSelectColumns(x)
